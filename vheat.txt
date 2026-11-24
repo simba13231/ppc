@@ -1,0 +1,770 @@
+// ==UserScript==
+// @name         Potato Panic Cheats
+// @namespace    https://potatopanic.com/
+// @version      1.3.0
+// @description  ESP + aimbot + triggerbot with a floating, rebindable GUI
+// @match        https://potatopanic.com/*
+// @run-at       document-start
+// @grant        none
+// ==/UserScript==
+
+(() => {
+  'use strict';
+
+  // ---------------------------------------------------------------- state
+  const S = {
+    esp: true,
+    aim: false,
+    trig: false,
+    gui: true,
+    binds: { gui: 'F2', esp: 'Backquote', aim: 'F3', trig: 'F4' },
+    rebinding: null,          // which action is waiting for a key
+    vp: null,                 // Float32Array(16) projection * view
+    start: null,              // last `start` payload
+    snap: null,               // last `snap` payload
+    slot: 0,                  // my current loadout slot
+    me: null,                 // {x,y,z} feet position
+    meHp: null,
+    pulse: { on: false, until: 0 },   // triggerbot fire pulse (cook safety)
+    lastKind: null,
+    fov: 25,                          // aimbot acquisition cone, degrees
+    gain: 0.5,                        // aimbot steering strength (per frame)
+    aimStyle: 'full',                 // 'full' | 'soft' | 'snap'
+    targetPri: 'crosshair',           // 'crosshair' | 'lowhp'
+    aimY: 1.05,                       // aim point height above enemy feet, m
+    norecoil: true,                   // cancel camera motion the mouse didn't cause
+    tracer: true,                     // ESP tracers from crosshair
+    arrows: true,                     // ESP off-screen direction arrows
+    aimHold: false,                   // aimbot key acts as hold, not toggle
+    est: null,                        // our estimate of the camera rig's yaw/pitch
+    prevObs: null,                    // last rig state observed on the wire
+    inj: { dx: 0, dy: 0 },            // mouse px injected since that observation
+    rDx: 0, rDy: 0,                   // real user mouse px since that observation
+    nY: 0.0022,                       // learned rad-per-px for yaw (game default)
+    nP: 0.0022,                       // learned rad-per-px for pitch (signed: invertY)
+    debug: '',
+  };
+
+  const WEAPONS = {
+    classic: [48, 13], wedge: [44, 1.5], boom: [30, 3.5], hot: [33, 15],
+    heavy: [25, 22], roller: [20, 24], cluster: [46, 12], grater: [42, 9],
+    popgun: [74, 2], mine: [23, 16], spring: [21, 17], piping: [31, 13],
+    battery: [36, 13], fork: [72, 0], rifle: [6000, 0], chiptube: [32, 0],
+    sling: [46, 10], waffle: [30, 1], peeler: [20, 0], salt: [26, 15],
+    mother: [24, 16],
+  };
+  const FLAG = { aim: 1 << 6, firePressed: 1 << 7, fireHeld: 1 << 8 };
+  const EYE = 1.55, CROUCH_EYE = 1.15, SLIDE_DROP = 0.55;
+  const TRIG_ERR = 3 * Math.PI / 180;  // triggerbot fire threshold
+  // rig's own pitch clamp (Xd.look: L(pitch,-1.4,1.05)) — the rig can never
+  // reach anything outside this, so every aim solve clamps to it too
+  const PITCH_MIN = -1.4, PITCH_MAX = 1.05;
+  const PX_CAP = 140;                  // per-event px; stays under the game's 150px jitter filter
+  const SOFT_CONE = 8 * Math.PI / 180; // soft aim only assists inside this
+  const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+  // ------------------------------------------------------------- helpers
+  const v3 = (a) => Array.isArray(a)
+    ? { x: +a[0] || 0, y: +a[1] || 0, z: +a[2] || 0 }
+    : (a && typeof a === 'object' && 'x' in a)
+      ? { x: +a.x || 0, y: +a.y || 0, z: +a.z || 0 }
+      : null;
+
+  const teamOf = (p) => (typeof p.team === 'number' ? p.team : (p.seat === 2 ? 2 : 1));
+
+  // game's own solver Ra(), verbatim math
+  function Ra(o, t, speed, g) {
+    const dx = t.x - o.x, dz = t.z - o.z, dy = t.y - o.y;
+    const s = Math.hypot(dx, dz);
+    if (s < 0.05) {
+      return { vx: 0, vy: (Math.sign(dy) || 1) * speed, vz: 0,
+               time: Math.abs(dy) / speed, ok: true };
+    }
+    if (g < 1e-6) {
+      const e = Math.hypot(s, dy);
+      return { vx: dx / e * speed, vy: dy / e * speed, vz: dz / e * speed,
+               time: e / speed, ok: true };
+    }
+    const c = speed * speed;
+    const disc = c * c - g * (g * s * s + 2 * dy * c);
+    let u, ok = true;
+    if (disc >= 0) u = Math.atan2(c - Math.sqrt(disc), g * s);
+    else { u = Math.PI / 4; ok = false; }
+    const cu = Math.cos(u), su = Math.sin(u);
+    return { vx: dx / s * cu * speed, vy: su * speed, vz: dz / s * cu * speed,
+             time: s / Math.max(0.001, cu * speed), ok };
+  }
+
+  // velocity -> (yaw, pitch) in the game's convention
+  function aimFromVel(v) {
+    const len = Math.hypot(v.vx, v.vy, v.vz) || 1;
+    return { yaw: Math.atan2(-v.vx, -v.vz), pitch: Math.asin(v.vy / len) };
+  }
+
+  // two-pass lead: solve, advance target by flight time, solve again
+  function solveShot(origin, tgt, kind) {
+    const [speed, g] = WEAPONS[kind] || WEAPONS.classic;
+    let sol = Ra(origin, tgt.pos, speed, g);
+    if (sol.time > 0 && (tgt.vel.x || tgt.vel.y || tgt.vel.z)) {
+      const pred = { x: tgt.pos.x + tgt.vel.x * sol.time,
+                     y: tgt.pos.y + tgt.vel.y * sol.time,
+                     z: tgt.pos.z + tgt.vel.z * sol.time };
+      sol = Ra(origin, pred, speed, g);
+    }
+    const a = aimFromVel(sol);
+    a.pitch = clamp(a.pitch, PITCH_MIN, PITCH_MAX);
+    a.ok = sol.ok;
+    return a;
+  }
+
+  // column-major mat4 * mat4
+  function mul4(a, b) {
+    const o = new Float32Array(16);
+    for (let c = 0; c < 4; c++)
+      for (let r = 0; r < 4; r++) {
+        let s = 0;
+        for (let k = 0; k < 4; k++) s += a[r + k * 4] * b[k + c * 4];
+        o[r + c * 4] = s;
+      }
+    return o;
+  }
+
+  // world -> screen; null when behind the camera
+  function project(m, p, w, h) {
+    const x = m[0] * p.x + m[4] * p.y + m[8] * p.z + m[12];
+    const y = m[1] * p.x + m[5] * p.y + m[9] * p.z + m[13];
+    const cw = m[3] * p.x + m[7] * p.y + m[11] * p.z + m[15];
+    if (cw <= 0.001) return null;
+    return { x: (x / cw * 0.5 + 0.5) * w, y: (-y / cw * 0.5 + 0.5) * h, w: cw };
+  }
+
+  const angDiff = (a, b) => Math.atan2(Math.sin(b - a), Math.cos(b - a));
+  const dist3 = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, a.z - b.z);
+
+  // ------------------------------------------------------------ GL hooks
+  // Capture projectionMatrix / viewMatrix from three.js uniform uploads so
+  // the ESP can project world coords without touching the game's objects.
+  function patchGL(proto) {
+    if (!proto || proto.__ppPatched) return;
+    proto.__ppPatched = true;
+    const locNames = new WeakMap();
+    const gu = proto.getUniformLocation;
+    proto.getUniformLocation = function (program, name) {
+      const loc = gu.call(this, program, name);
+      if (loc && (name === 'viewMatrix' || name === 'projectionMatrix'))
+        locNames.set(loc, name);
+      return loc;
+    };
+    const um = proto.uniformMatrix4fv;
+    proto.uniformMatrix4fv = function (loc, transpose, value) {
+      const n = loc && locNames.get(loc);
+      if (n && value && value.length === 16) {
+        if (n === 'viewMatrix') M.view = new Float32Array(value);
+        else M.proj = new Float32Array(value);
+      }
+      return um.call(this, loc, transpose, value);
+    };
+  }
+  const M = { view: null, proj: null };
+  patchGL(window.WebGLRenderingContext && WebGLRenderingContext.prototype);
+  patchGL(window.WebGL2RenderingContext && WebGL2RenderingContext.prototype);
+
+  // -------------------------------------------------------- WS hooks
+  // Wrap the duel socket: read start/sack/snap, rewrite outgoing input.
+  const RealWS = window.WebSocket;
+  window.WebSocket = class PPWebSocket extends RealWS {
+    constructor(url, protocols) {
+      super(url, protocols);
+      if (!String(url).includes('/api/match/duel/')) return;
+
+      const realSend = RealWS.prototype.send;
+      this.send = (data) => {
+        let out = data;
+        try {
+          const msg = JSON.parse(String(data));
+          if (msg && msg.t === 'in' && Array.isArray(msg.c) && msg.c.length) {
+            // last cmd in the batch is the newest sample of cameraRig.yaw/pitch
+            const last = msg.c[msg.c.length - 1];
+            if (typeof last[2] === 'number' && typeof last[3] === 'number')
+              observeRig(last[2], last[3]);
+            for (const cmd of msg.c) mutateCmd(cmd);
+            out = JSON.stringify(msg);
+          }
+        } catch (_) { /* not JSON, pass through */ }
+        realSend.call(this, out);
+      };
+
+      this.addEventListener('message', (ev) => {
+        try {
+          const msg = JSON.parse(String(ev.data));
+          if (msg && typeof msg === 'object') onServerMsg(msg);
+        } catch (_) { /* binary or partial, ignore */ }
+      });
+    }
+  };
+
+  function onServerMsg(m) {
+    if (m.t === 'start') {
+      S.start = m;
+      S.slot = 0;
+      S.snap = null;
+    } else if (m.t === 'sack') {
+      const p = (S.start && S.start.players || [])
+        .find((p) => p.seat === m.seat);
+      if (p && Array.isArray(m.loadout)) p.loadout = m.loadout;
+    } else if (m.t === 'snap') {
+      S.snap = m;
+      readOwnState(m);
+    }
+  }
+
+  function readOwnState(m) {
+    if (!m || !m.me) return;
+    const p = v3(m.me.p && (m.me.p.pos !== undefined ? m.me.p.pos : m.me.p));
+    if (p) S.me = p;
+    if (m.me.h && typeof m.me.h.hp === 'number') S.meHp = m.me.h.hp;
+  }
+
+  function myLoadout() {
+    if (!S.start || !Array.isArray(S.start.players)) return null;
+    const me = S.start.players.find((p) => p.seat === S.start.you);
+    return me && Array.isArray(me.loadout) ? me.loadout : null;
+  }
+
+  function currentKind() {
+    // prefer the thrower's own reported selection, fall back to slot math
+    if (S.snap && S.snap.me && S.snap.me.w &&
+        typeof S.snap.me.w.selected === 'string' &&
+        WEAPONS[S.snap.me.w.selected]) {
+      S.lastKind = S.snap.me.w.selected;
+      return S.lastKind;
+    }
+    const lo = myLoadout();
+    if (lo && lo.length) {
+      S.lastKind = lo[Math.min(S.slot, lo.length - 1)];
+      return S.lastKind;
+    }
+    return S.lastKind || 'classic';
+  }
+
+  // enemies decoded from the raw snapshot state
+  function enemies() {
+    if (!S.snap || !Array.isArray(S.snap.them) || !S.start) return [];
+    const mySeat = S.start.you;
+    const myTeam = teamOf(S.start.players.find((p) => p.seat === mySeat) || { seat: mySeat });
+    const out = [];
+    for (const e of S.snap.them) {
+      if (!e || e.seat === mySeat || !e.s) continue;
+      const pos = v3(e.s.p), vel = v3(e.s.v) || { x: 0, y: 0, z: 0 };
+      if (!pos) continue;
+      const hp = +e.s.hp || 0;
+      if (hp <= 0) continue;
+      const info = (S.start.players || []).find((p) => p.seat === e.seat) || { seat: e.seat };
+      out.push({
+        seat: e.seat,
+        name: info.name || ('seat ' + e.seat),
+        ally: teamOf(info) === myTeam,
+        pos, vel, hp,
+        crouch: !!((+e.s.b || 0) & 4),
+        slide: !!((+e.s.b || 0) & 2),
+        kind: typeof e.s.sk === 'string' ? e.s.sk : null,
+      });
+    }
+    return out;
+  }
+
+  // pick the enemy nearest the current aim, inside the acquisition cone;
+  // target priority 'lowhp' finishes the wounded one instead
+  function selectTarget(yaw, pitch) {
+    if (!S.me) return null;
+    const fx = -Math.sin(yaw) * Math.cos(pitch);
+    const fy = Math.sin(pitch);
+    const fz = -Math.cos(yaw) * Math.cos(pitch);
+    const cone = S.fov * Math.PI / 180;
+    let pick = null;
+    for (const en of enemies()) {
+      const o = { x: S.me.x, y: S.me.y + EYE, z: S.me.z };
+      // aim point above the feet; lower when crouched
+      const tp = { x: en.pos.x, y: en.pos.y + S.aimY - (en.crouch ? 0.25 : 0), z: en.pos.z };
+      const sol = solveShot(o, { pos: tp, vel: en.vel }, currentKind());
+      const dx = -Math.sin(sol.yaw) * Math.cos(sol.pitch);
+      const dy = Math.sin(sol.pitch);
+      const dz = -Math.cos(sol.yaw) * Math.cos(sol.pitch);
+      const err = Math.acos(Math.max(-1, Math.min(1, fx * dx + fy * dy + fz * dz)));
+      if (err >= cone) continue;
+      if (!pick) { pick = { en, sol, err }; continue; }
+      const better = S.targetPri === 'lowhp'
+        ? en.hp < pick.en.hp || (en.hp === pick.en.hp && err < pick.err)
+        : err < pick.err;
+      if (better) pick = { en, sol, err };
+    }
+    return pick;
+  }
+
+  // -------------------------------------------------- rig observation
+  // Local throws spawn along cameraRig.yaw/pitch (tick samples the rig, not
+  // the wire), so aiming means moving the rig itself. Every `in` batch
+  // carries fresh samples; the last cmd is the newest rig state.
+  function observeRig(yaw, pitch) {
+    const o = S.prevObs;
+    const totX = S.rDx + S.inj.dx;     // all mouse px this interval (real + ours)
+    const totY = S.rDy + S.inj.dy;
+    if (o) {
+      const dY = angDiff(o.yaw, yaw);
+      const dP = pitch - o.pitch;
+      // learn rad-per-px from the FULL captured delta. magnitude range is
+      // the only guard: an agreement check would block forever whenever the
+      // default sens or the invertY sign is wrong — that bug aimed people
+      // at the sky.
+      if (Math.abs(totX) >= 15) {
+        const n = -dY / totX;
+        if (n > 0.0002 && n < 0.02) S.nY += (n - S.nY) * 0.3;
+      }
+      if (Math.abs(totY) >= 15) {
+        const n = -dP / totY;
+        if (Math.abs(n) > 0.0002 && Math.abs(n) < 0.02) S.nP += (n - S.nP) * 0.3;
+      }
+      // no-recoil: cancel camera motion the mouse didn't explain. only when
+      // aimbot is off (it corrects recoil itself) and the user is idle
+      // (a shaky hand would read as recoil), capped per observation
+      if (S.norecoil && !S.aim && document.pointerLockElement &&
+          Math.abs(S.rDx) <= 20 && Math.abs(S.rDy) <= 20) {
+        const resY = dY + totX * S.nY;   // expected delta from mouse is -tot*n
+        const resP = dP + totY * S.nP;
+        S.res = { y: resY, p: resP };
+      } else S.res = null;
+    }
+    S.prevObs = { yaw, pitch };
+    S.inj.dx = 0; S.inj.dy = 0;
+    S.rDx = 0; S.rDy = 0;
+    S.est = { yaw, pitch };
+    // dispatch after the reset so this correction rides the NEXT interval
+    if (S.res) {
+      if (Math.abs(S.res.y) >= 0.004 && Math.abs(S.res.y) <= 0.3)
+        injectMouse(clamp(S.res.y / S.nY, -40, 40), 0);
+      if (Math.abs(S.res.p) >= 0.004 && Math.abs(S.res.p) <= 0.3)
+        injectMouse(0, clamp(S.res.p / S.nP, -40, 40));
+      S.res = null;
+    }
+  }
+
+  // synthetic mousemove — the game's own look() turns this into rig motion
+  function injectMouse(dx, dy) {
+    S.inj.dx += dx; S.inj.dy += dy;
+    const el = document.pointerLockElement || document.body || document;
+    const ev = new MouseEvent('mousemove',
+      { movementX: dx, movementY: dy, bubbles: true });
+    ev.__ppSyn = true;                 // our capture listener skips these
+    el.dispatchEvent(ev);
+  }
+
+  // real user mouse only (synthetic events tagged and dropped here)
+  window.addEventListener('mousemove', (e) => {
+    if (e.__ppSyn) return;
+    S.rDx += e.movementX || 0;
+    S.rDy += e.movementY || 0;
+  }, true);
+
+  // --------------------------------------------------- rig steering
+  // look(): yaw -= dx*n, pitch -= dy*n — so px = -rad/n. Inject mousemove
+  // events and the game's own input path turns them into real rig motion,
+  // which then rides out on the next command sample.
+  function steerStep() {
+    if (!S.aim || !S.est || !S.me) return;
+    if (!document.pointerLockElement) return;  // game ignores look unlocked
+    const tgt = selectTarget(S.est.yaw, S.est.pitch);
+    if (!tgt) return;
+    const eY = angDiff(S.est.yaw, tgt.sol.yaw);
+    const eP = clamp(tgt.sol.pitch, PITCH_MIN, PITCH_MAX) - S.est.pitch;
+    const err = Math.hypot(eY, eP);
+    if (err < 0.0015) return;                    // ~0.09° — good enough
+    if (S.aimStyle === 'soft' && err > SOFT_CONE) return;  // assist only, never yank
+    const g = S.aimStyle === 'snap' ? 1
+            : S.aimStyle === 'soft' ? 0.15
+            : S.gain;
+    const dx = clamp(-(eY * g) / S.nY, -PX_CAP, PX_CAP);
+    const dy = clamp(-(eP * g) / S.nP, -PX_CAP, PX_CAP);
+    if (Math.abs(dx) < 0.4 && Math.abs(dy) < 0.4) return;
+    injectMouse(dx, dy);
+  }
+  function steerFrame() {
+    requestAnimationFrame(steerFrame);
+    steerStep();
+  }
+  window.__ppSteer = steerStep;   // mock harness drives steps without a visible rAF
+
+  // -------------------------------------------------- outgoing command
+  function mutateCmd(cmd) {
+    if (!Array.isArray(cmd) || cmd.length < 7) return;
+
+    // track slot selection so we know which weapon is up
+    if (typeof cmd[5] === 'number' && cmd[5] >= 0) S.slot = cmd[5];
+    if (cmd[6] === 1) { const lo = myLoadout(); const n = lo ? lo.length : 4; S.slot = (S.slot + 1) % n; }
+    else if (cmd[6] === -1) { const lo = myLoadout(); const n = lo ? lo.length : 4; S.slot = (S.slot + n - 1) % n; }
+
+    if (!S.trig) { S.pulse.on = false; S.pulse.held = false; S.pulse.until = 0; return; }
+    if (!S.me) return;
+
+    // fire when the rig — which steerFrame drives onto the solution — is close
+    const ref = S.est || { yaw: cmd[2], pitch: cmd[3] };
+    const tgt = selectTarget(ref.yaw, ref.pitch);
+    if (!tgt) { S.pulse.on = false; S.pulse.held = false; return; }
+    const eY = angDiff(ref.yaw, tgt.sol.yaw);
+    const eP = clamp(tgt.sol.pitch, PITCH_MIN, PITCH_MAX) - ref.pitch;
+    if (Math.hypot(eY, eP) < TRIG_ERR) {
+        // pulse fire so cook weapons release before they overcook
+        const now = performance.now();
+        if (!S.pulse.on && now >= S.pulse.until) { S.pulse.on = true; S.pulse.until = now + 250; }
+        else if (S.pulse.on && now >= S.pulse.until) { S.pulse.on = false; S.pulse.until = now + 150; }
+        if (S.pulse.on) {
+          cmd[4] |= FLAG.aim | FLAG.fireHeld;
+          if (!S.pulse.held) cmd[4] |= FLAG.firePressed;
+          S.pulse.held = true;
+        } else S.pulse.held = false;
+      } else { S.pulse.on = false; S.pulse.held = false; }
+  }
+
+  // ------------------------------------------------------------- input
+  // Keys the game itself binds — if the user rebinds onto one of these we
+  // still let it through so movement/aim don't silently die.
+  const GAME_KEYS = new Set([
+    'KeyA', 'KeyB', 'KeyC', 'KeyD', 'KeyE', 'KeyQ', 'KeyR', 'KeyW', 'KeyS',
+    'Space', 'ControlLeft', 'ControlRight', 'ShiftLeft', 'ShiftRight', 'Tab',
+    'Digit1', 'Digit2', 'Digit3', 'Digit4', 'Digit5',
+    'Digit6', 'Digit7', 'Digit8', 'Digit9', 'Digit0', 'Escape',
+  ]);
+  const isBound = (code) => Object.values(S.binds).includes(code);
+  window.addEventListener('keydown', (e) => {
+    if (S.rebinding) {
+      S.binds[S.rebinding] = e.code;
+      S.rebinding = null;
+      renderGUI();
+      e.preventDefault(); e.stopPropagation();
+      return;
+    }
+    if (!isBound(e.code)) return;
+    if (e.code === S.binds.gui) S.gui = !S.gui;
+    else if (e.code === S.binds.esp) S.esp = !S.esp;
+    else if (e.code === S.binds.aim) S.aim = S.aimHold ? true : !S.aim;
+    else if (e.code === S.binds.trig) {
+      S.trig = !S.trig;
+      S.pulse.on = false; S.pulse.held = false; S.pulse.until = 0;
+    }
+    renderGUI();
+    // swallow only non-game keys (F-keys, `); game keys pass through
+    if (!GAME_KEYS.has(e.code)) { e.preventDefault(); e.stopPropagation(); }
+  }, true);
+  window.addEventListener('keyup', (e) => {
+    if (S.aimHold && e.code === S.binds.aim && S.aim) {
+      S.aim = false;
+      renderGUI();
+    }
+  }, true);
+
+  // -------------------------------------------------------------- GUI
+  const css = `
+  #pp-cheat{position:fixed;top:18px;right:18px;z-index:2147483647;width:238px;
+    font:12px/1.45 ui-monospace,Consolas,monospace;color:#eae4d6;
+    background:rgba(24,22,18,.94);border:2px solid #594f3d;border-radius:8px;
+    box-shadow:0 6px 22px rgba(0,0,0,.55);user-select:none}
+  #pp-cheat .hd{cursor:move;padding:7px 10px;background:#332c22;border-bottom:2px solid #594f3d;
+    border-radius:6px 6px 0 0;font-weight:700;letter-spacing:.06em;color:#f2d81d;
+    display:flex;justify-content:space-between;align-items:center}
+  #pp-cheat .hd span{color:#8f8672;font-weight:400;font-size:10px}
+  #pp-cheat .rw{display:flex;align-items:center;gap:7px;padding:6px 10px}
+  #pp-cheat .rw+.rw{border-top:1px dashed #3d372c}
+  #pp-cheat .lb{flex:1;cursor:pointer}
+  #pp-cheat .tg{width:44px;padding:2px 0;text-align:center;border-radius:4px;cursor:pointer;
+    border:1px solid #594f3d;background:#2a251d;color:#a89e8a;font-weight:700}
+  #pp-cheat .tg.on{background:#2f5d2a;border-color:#57a34e;color:#b9f5ae}
+  #pp-cheat .bd{min-width:64px;padding:2px 6px;text-align:center;border-radius:4px;cursor:pointer;
+    border:1px solid #594f3d;background:#2a251d;color:#d9cfb6;font-size:10px}
+  #pp-cheat .bd.wait{background:#6b5410;color:#ffe27a}
+  #pp-cheat .sl{flex:1.2;accent-color:#f2d81d;height:14px;cursor:pointer}
+  #pp-cheat .lb b{color:#f2d81d;font-weight:700}
+  #pp-cheat .st{padding:6px 10px;border-top:2px solid #594f3d;font-size:10px;color:#8f8672;
+    word-break:break-all;border-radius:0 0 6px 6px}
+  #pp-cheat .st b{color:#eae4d6;font-weight:600}
+  #ppHud{position:fixed;left:12px;top:12px;z-index:2147483647;pointer-events:none;
+    font:11px/1.6 ui-monospace,Consolas,monospace;color:#f2d81d;
+    text-shadow:0 1px 3px #000;letter-spacing:.05em}
+  #ppHud i{font-style:normal;color:#6b6455}
+  #ppHud .g{color:#7fe07a} #ppHud .r{color:#ff6b5e}`;
+
+  let guiEl = null, hudEl = null;
+
+  function prettyKey(code) {
+    if (!code) return '—';
+    if (code.startsWith('Key')) return code.slice(3);
+    if (code.startsWith('Digit')) return code.slice(5);
+    if (code === 'Backquote') return '`';
+    if (code === 'Space') return 'SPC';
+    return code.replace('Left', '←').replace('Right', '→');
+  }
+
+  function renderGUI() {
+    if (!guiEl) return;
+    guiEl.style.display = S.gui ? '' : 'none';
+    const row = (key, label) => `
+      <div class="rw">
+        <span class="lb" data-t="${key}">${label}</span>
+        <button class="tg ${S[key] ? 'on' : ''}" data-t="${key}">${S[key] ? 'ON' : 'OFF'}</button>
+        <button class="bd ${S.rebinding === key ? 'wait' : ''}" data-b="${key}">
+          ${S.rebinding === key ? 'press…' : prettyKey(S.binds[key])}</button>
+      </div>`;
+    const opt = (key, label) => `
+      <div class="rw">
+        <span class="lb" data-t="${key}">${label}</span>
+        <button class="tg ${S[key] ? 'on' : ''}" data-t="${key}">${S[key] ? 'ON' : 'OFF'}</button>
+      </div>`;
+    const cyc = (key, label) => `
+      <div class="rw">
+        <span class="lb" data-c="${key}">${label}</span>
+        <button class="tg on" data-c="${key}" style="width:auto;padding:2px 7px">${S[key].toUpperCase()}</button>
+      </div>`;
+    guiEl.innerHTML = `
+      <div class="hd" id="ppHd">POTATO PANIC <span>draggable · F2 hide</span></div>
+      ${row('esp', 'ESP (wallhack)')}
+      ${opt('tracer', 'Tracers')}
+      ${opt('arrows', 'Off-screen arrows')}
+      ${row('aim', 'Aimbot')}
+      ${cyc('aimStyle', 'Aim style')}
+      ${cyc('targetPri', 'Target')}
+      ${opt('aimHold', 'Aim key = hold')}
+      ${opt('norecoil', 'No-recoil')}
+      ${row('trig', 'Triggerbot')}
+      <div class="rw">
+        <span class="lb" style="cursor:default">Cone <b id="ppFovV">${S.fov}</b>°</span>
+        <input class="sl" id="ppFov" type="range" min="5" max="90" step="1" value="${S.fov}">
+      </div>
+      <div class="rw">
+        <span class="lb" style="cursor:default">Gain <b id="ppGainV">${S.gain.toFixed(2)}</b></span>
+        <input class="sl" id="ppGain" type="range" min="0.10" max="1.00" step="0.05" value="${S.gain}">
+      </div>
+      <div class="rw">
+        <span class="lb" style="cursor:default">Aim h <b id="ppAimYV">${S.aimY.toFixed(2)}</b>m</span>
+        <input class="sl" id="ppAimY" type="range" min="0" max="2" step="0.05" value="${S.aimY}">
+      </div>
+      <div class="st" id="ppSt">booting…</div>`;
+
+    const CYCLE = { aimStyle: ['full', 'soft', 'snap'], targetPri: ['crosshair', 'lowhp'] };
+    guiEl.querySelectorAll('[data-c]').forEach((el) =>
+      el.addEventListener('click', () => {
+        const opts = CYCLE[el.dataset.c];
+        const i = opts.indexOf(S[el.dataset.c]);
+        S[el.dataset.c] = opts[(i + 1) % opts.length];
+        renderGUI();
+      }));
+
+    guiEl.querySelectorAll('[data-t]').forEach((el) =>
+      el.addEventListener('click', () => { S[el.dataset.t] = !S[el.dataset.t]; renderGUI(); }));
+    guiEl.querySelectorAll('[data-b]').forEach((el) =>
+      el.addEventListener('click', () => { S.rebinding = el.dataset.b; renderGUI(); }));
+
+    // sliders update in place — re-rendering mid-drag would kill the thumb
+    const fv = guiEl.querySelector('#ppFov');
+    fv.addEventListener('input', () => {
+      S.fov = +fv.value;
+      guiEl.querySelector('#ppFovV').textContent = fv.value;
+    });
+    const gv = guiEl.querySelector('#ppGain');
+    gv.addEventListener('input', () => {
+      S.gain = +gv.value;
+      guiEl.querySelector('#ppGainV').textContent = S.gain.toFixed(2);
+    });
+    const av = guiEl.querySelector('#ppAimY');
+    av.addEventListener('input', () => {
+      S.aimY = +av.value;
+      guiEl.querySelector('#ppAimYV').textContent = S.aimY.toFixed(2);
+    });
+
+    const hd = guiEl.querySelector('#ppHd');
+    hd.addEventListener('pointerdown', (ev) => {
+      const r = guiEl.getBoundingClientRect();
+      const ox = ev.clientX - r.left, oy = ev.clientY - r.top;
+      const move = (e2) => {
+        guiEl.style.left = (e2.clientX - ox) + 'px';
+        guiEl.style.top = (e2.clientY - oy) + 'px';
+        guiEl.style.right = 'auto';
+      };
+      const up = () => {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', up);
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', up);
+      ev.preventDefault();
+    });
+  }
+
+  function boot() {
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
+
+    guiEl = document.createElement('div');
+    guiEl.id = 'pp-cheat';
+    document.body.appendChild(guiEl);
+    renderGUI();
+
+    requestAnimationFrame(steerFrame);
+
+    hudEl = document.createElement('div');
+    hudEl.id = 'ppHud';
+    document.body.appendChild(hudEl);
+
+    setInterval(() => {
+      const on = [];
+      if (S.esp) on.push('<span class="g">ESP</span>');
+      if (S.aim) on.push('<span class="g">AIM</span>');
+      if (S.trig) on.push('<span class="g">TRIG</span>');
+      hudEl.innerHTML = on.length
+        ? on.join(' <i>|</i> ') + ` <i>·</i> <i>${prettyKey(S.binds.esp)}/${prettyKey(S.binds.aim)}/${prettyKey(S.binds.trig)}</i>`
+        : '';
+      const st = document.getElementById('ppSt');
+      if (st) {
+        const vp = M.view && M.proj ? '✓' : '✗';
+        const me = S.me ? `${S.me.x.toFixed(1)},${S.me.y.toFixed(1)},${S.me.z.toFixed(1)}` : '—';
+        const foes = enemies().length;
+        st.innerHTML =
+          `vp <b>${vp}</b> · me <b>${me}</b> · hp <b>${S.meHp ?? '—'}</b><br>` +
+          `foes <b>${foes}</b> · weapon <b>${currentKind()}</b> · slot <b>${S.slot}</b><br>` +
+          `rig <b>${S.est ? S.est.yaw.toFixed(2) + ',' + S.est.pitch.toFixed(2) : '—'}</b>` +
+          ` · px/rad <b>${(1 / S.nY).toFixed(0)}</b>` +
+          ` · pitchGain <b>${S.nP.toFixed(4)}</b>` +
+          ` · <b>${S.aimStyle}</b>` +
+          ` · tgt <b>${S.aim && selectTarget(S.est ? S.est.yaw : 0, S.est ? S.est.pitch : 0) ? 'lock' : '—'}</b>`;
+      }
+    }, 250);
+
+    // ESP draw loop
+    const canvas = document.createElement('canvas');
+    canvas.style.cssText = 'position:fixed;inset:0;z-index:2147483646;pointer-events:none';
+    document.body.appendChild(canvas);
+    const ctx = canvas.getContext('2d');
+    const fit = () => {
+      canvas.width = innerWidth * devicePixelRatio;
+      canvas.height = innerHeight * devicePixelRatio;
+      canvas.style.width = innerWidth + 'px';
+      canvas.style.height = innerHeight + 'px';
+    };
+    fit();
+    addEventListener('resize', fit);
+
+    const draw = () => {
+      requestAnimationFrame(draw);
+      ctx.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+      ctx.clearRect(0, 0, innerWidth, innerHeight);
+      if (!S.esp || !M.view || !M.proj) return;
+      const vp = mul4(M.proj, M.view);
+      const W = innerWidth, H = innerHeight;
+      const cx = W / 2, cy = H / 2;
+
+      // aim-assist circle: exact cone radius off the projection's fovY
+      if (S.aim) {
+        const f = M.proj[5];
+        if (f > 0) {
+          const fovY = 2 * Math.atan(1 / f);
+          const cone = S.aimStyle === 'soft' ? SOFT_CONE : S.fov * Math.PI / 180;
+          const r = Math.tan(cone) / Math.tan(fovY / 2) * (H / 2);
+          ctx.save();
+          ctx.strokeStyle = 'rgba(242,216,29,.5)';
+          ctx.lineWidth = 1.5;
+          ctx.setLineDash([6, 6]);
+          ctx.beginPath();
+          ctx.arc(cx, cy, r, 0, Math.PI * 2);
+          ctx.stroke();
+          ctx.restore();
+        }
+      }
+
+      for (const en of enemies()) {
+        const chest = { x: en.pos.x, y: en.pos.y + (en.crouch ? 0.75 : 1.05), z: en.pos.z };
+        const scr = project(vp, chest, W, H);
+        const onScr = scr && scr.x >= 0 && scr.x <= W && scr.y >= 0 && scr.y <= H;
+
+        if (!onScr) {
+          if (!S.arrows) continue;
+          // direction to turn: projected offset when in front, view-space
+          // sign when behind (x>0 → turn right, y>0 → turn up)
+          let dx, dy;
+          if (scr) { dx = scr.x - cx; dy = scr.y - cy; }
+          else {
+            const v = M.view;
+            dx = v[0] * chest.x + v[4] * chest.y + v[8] * chest.z + v[12];
+            dy = -(v[1] * chest.x + v[5] * chest.y + v[9] * chest.z + v[13]);
+          }
+          const L = Math.hypot(dx, dy);
+          const ux = L > 0.01 ? dx / L : 0, uy = L > 0.01 ? dy / L : -1;
+          const R = Math.min(W, H) * 0.4;
+          ctx.save();
+          ctx.translate(cx + ux * R, cy + uy * R);
+          ctx.rotate(Math.atan2(uy, ux));
+          ctx.fillStyle = en.ally ? '#4dd2ff' : '#ff4d4d';
+          ctx.beginPath();
+          ctx.moveTo(11, 0); ctx.lineTo(-7, 7); ctx.lineTo(-7, -7);
+          ctx.closePath(); ctx.fill();
+          ctx.restore();
+          const ad = S.me ? Math.round(dist3(chest, S.me)) : null;
+          if (ad !== null) {
+            ctx.font = '700 11px ui-monospace, monospace';
+            ctx.textAlign = 'left';
+            ctx.fillStyle = '#000c';
+            ctx.fillText(ad + 'm', cx + ux * R + 13, cy + uy * R + 4);
+            ctx.fillStyle = en.ally ? '#9be6ff' : '#ffd9d4';
+            ctx.fillText(ad + 'm', cx + ux * R + 12, cy + uy * R + 3);
+          }
+          continue;
+        }
+
+        if (S.tracer) {
+          ctx.strokeStyle = en.ally ? 'rgba(77,210,255,.7)' : 'rgba(255,77,77,.7)';
+          ctx.lineWidth = 1.5;
+          ctx.beginPath();
+          ctx.moveTo(cx, cy);
+          ctx.lineTo(scr.x, scr.y);
+          ctx.stroke();
+        }
+
+        const feet = project(vp, en.pos, W, H);
+        const head = project(vp, { x: en.pos.x, y: en.pos.y + (en.crouch ? 1.15 : 1.7), z: en.pos.z }, W, H);
+        if (!feet || !head) continue;
+        const h = feet.y - head.y;
+        if (h < 4 || h > H * 3) continue;
+        const w = h * 0.55;
+        const x = head.x - w / 2, y = head.y;
+        ctx.strokeStyle = en.ally ? '#4dd2ff' : '#ff4d4d';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x, y, w, h);
+        // hp bar
+        const maxHp = (S.start && +S.start.hp) || 100;
+        ctx.fillStyle = '#000a';
+        ctx.fillRect(x, y - 6, w, 4);
+        ctx.fillStyle = en.ally ? '#4dd2ff' : '#7fe07a';
+        ctx.fillRect(x, y - 6, w * Math.min(1, en.hp / maxHp), 4);
+        // name + distance
+        const d = S.me ? Math.round(dist3(en.pos, S.me)) : null;
+        const label = `${en.name} ${d !== null ? d + 'm' : ''}`;
+        ctx.font = '600 11px ui-monospace, monospace';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = '#000c';
+        ctx.fillText(label, head.x, y - 9);
+        ctx.fillStyle = en.ally ? '#9be6ff' : '#ffd9d4';
+        ctx.fillText(label, head.x, y - 10);
+        // hp number inside the box — who is one hit from done
+        ctx.font = '700 11px ui-monospace, monospace';
+        ctx.textAlign = 'left';
+        ctx.fillStyle = '#000c';
+        ctx.fillText(String(en.hp), x + 4, y + 14);
+        ctx.fillStyle = en.hp <= 30 ? '#ff6b5e' : '#eae4d6';
+        ctx.fillText(String(en.hp), x + 3, y + 13);
+      }
+    };
+    window.__ppDraw = draw;         // mock harness drives frames without rAF
+    requestAnimationFrame(draw);
+  }
+
+  if (document.readyState === 'loading')
+    document.addEventListener('DOMContentLoaded', boot, { once: true });
+  else boot();
+})();
