@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Potato Panic Cheats
 // @namespace    https://potatopanic.com/
-// @version      1.3.0
-// @description  ESP + aimbot + triggerbot with a floating, rebindable GUI
+// @version      1.4.0
+// @description  ESP + aimbot + triggerbot + intent warnings + auto-dodge, floating rebindable GUI
 // @match        https://potatopanic.com/*
 // @run-at       document-start
 // @grant        none
@@ -36,6 +36,11 @@
     tracer: true,                     // ESP tracers from crosshair
     arrows: true,                     // ESP off-screen direction arrows
     aimHold: false,                   // aimbot key acts as hold, not toggle
+    trigMode: 'pulse',                // 'pulse' (cook-safe) | 'hold' (max dps)
+    autosprint: true,                 // hold the sprint bit whenever moving
+    dodge: true,                      // strafe off anyone lining up a shot
+    dodgeUntil: 0,                    // ms timestamp — active dodge window
+    dodgeYaw: 0,                      // thrower's look yaw, for strafe direction
     est: null,                        // our estimate of the camera rig's yaw/pitch
     prevObs: null,                    // last rig state observed on the wire
     inj: { dx: 0, dy: 0 },            // mouse px injected since that observation
@@ -53,7 +58,7 @@
     sling: [46, 10], waffle: [30, 1], peeler: [20, 0], salt: [26, 15],
     mother: [24, 16],
   };
-  const FLAG = { aim: 1 << 6, firePressed: 1 << 7, fireHeld: 1 << 8 };
+  const FLAG = { sprint: 1 << 0, aim: 1 << 6, firePressed: 1 << 7, fireHeld: 1 << 8 };
   const EYE = 1.55, CROUCH_EYE = 1.15, SLIDE_DROP = 0.55;
   const TRIG_ERR = 3 * Math.PI / 180;  // triggerbot fire threshold
   // rig's own pitch clamp (Xd.look: L(pitch,-1.4,1.05)) — the rig can never
@@ -61,6 +66,7 @@
   const PITCH_MIN = -1.4, PITCH_MAX = 1.05;
   const PX_CAP = 140;                  // per-event px; stays under the game's 150px jitter filter
   const SOFT_CONE = 8 * Math.PI / 180; // soft aim only assists inside this
+  const WATCH_CONE = 12 * Math.PI / 180; // "their crosshair is on me" cone
   const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
 
   // ------------------------------------------------------------- helpers
@@ -260,14 +266,37 @@
       const hp = +e.s.hp || 0;
       if (hp <= 0) continue;
       const info = (S.start.players || []).find((p) => p.seat === e.seat) || { seat: e.seat };
+      const ally = teamOf(info) === myTeam;
+      const b = +e.s.b || 0;
+      // intent: is their crosshair on me, and have they committed a throw?
+      let watching = false;
+      if (typeof e.s.ly === 'number' && typeof e.s.lp === 'number' && S.me) {
+        const fx = -Math.sin(e.s.ly) * Math.cos(e.s.lp);
+        const fy = Math.sin(e.s.lp);
+        const fz = -Math.cos(e.s.ly) * Math.cos(e.s.lp);
+        const tx = S.me.x - pos.x, ty = S.me.y + EYE - pos.y, tz = S.me.z - pos.z;
+        const L = Math.hypot(tx, ty, tz) || 1;
+        watching = (fx * tx + fy * ty + fz * tz) / L > Math.cos(WATCH_CONE);
+      }
+      const phase = typeof e.s.tp === 'string' ? e.s.tp : 'ready';
+      // dry = mag weapon mid-reload or out of ammo (free kill window)
+      const dry = (+e.s.mg || 0) > 0 &&
+        ((typeof e.s.rd === 'number' && e.s.rd >= 0) || +e.s.am === 0);
+      const incoming = !ally && watching && !!S.me && dist3(pos, S.me) < 45 &&
+        (phase === 'windup' || (+e.s.ck || 0) > 0.3 || ((b & 16) && (b & 32)));
       out.push({
         seat: e.seat,
         name: info.name || ('seat ' + e.seat),
-        ally: teamOf(info) === myTeam,
+        ally,
         pos, vel, hp,
-        crouch: !!((+e.s.b || 0) & 4),
-        slide: !!((+e.s.b || 0) & 2),
+        crouch: !!(b & 4),
+        slide: !!(b & 2),
         kind: typeof e.s.sk === 'string' ? e.s.sk : null,
+        throwKind: typeof e.s.tk === 'string' ? e.s.tk : null,
+        watchYaw: typeof e.s.ly === 'number' ? e.s.ly : null,
+        watching, incoming, dry,
+        cook: +e.s.ck || 0,
+        shielded: !!(b & 128),
       });
     }
     return out;
@@ -295,7 +324,9 @@
       if (!pick) { pick = { en, sol, err }; continue; }
       const better = S.targetPri === 'lowhp'
         ? en.hp < pick.en.hp || (en.hp === pick.en.hp && err < pick.err)
-        : err < pick.err;
+        : S.targetPri === 'threat'
+          ? (en.watching !== pick.en.watching ? en.watching : err < pick.err)
+          : err < pick.err;
       if (better) pick = { en, sol, err };
     }
     return pick;
@@ -392,6 +423,7 @@
     steerStep();
   }
   window.__ppSteer = steerStep;   // mock harness drives steps without a visible rAF
+  window.__ppSelect = selectTarget;
 
   // -------------------------------------------------- outgoing command
   function mutateCmd(cmd) {
@@ -401,6 +433,28 @@
     if (typeof cmd[5] === 'number' && cmd[5] >= 0) S.slot = cmd[5];
     if (cmd[6] === 1) { const lo = myLoadout(); const n = lo ? lo.length : 4; S.slot = (S.slot + 1) % n; }
     else if (cmd[6] === -1) { const lo = myLoadout(); const n = lo ? lo.length : 4; S.slot = (S.slot + n - 1) % n; }
+
+    // auto-sprint: full speed whenever there's any movement input
+    if (S.autosprint && (cmd[0] || cmd[1])) cmd[4] |= FLAG.sprint;
+
+    // auto-dodge: someone lining up on me → strafe perpendicular to their
+    // throw for a beat, sprinting. direction = their look yaw vs ours.
+    if (S.dodge && S.me) {
+      const now = performance.now();
+      if (now >= S.dodgeUntil) {
+        for (const en of enemies()) {
+          if (en.incoming && en.watchYaw !== null) {
+            S.dodgeUntil = now + 600;
+            S.dodgeYaw = en.watchYaw;
+            break;
+          }
+        }
+      }
+      if (now < S.dodgeUntil) {
+        cmd[0] = Math.cos(S.dodgeYaw - cmd[2]);
+        cmd[4] |= FLAG.sprint;
+      }
+    }
 
     if (!S.trig) { S.pulse.on = false; S.pulse.held = false; S.pulse.until = 0; return; }
     if (!S.me) return;
@@ -412,15 +466,23 @@
     const eY = angDiff(ref.yaw, tgt.sol.yaw);
     const eP = clamp(tgt.sol.pitch, PITCH_MIN, PITCH_MAX) - ref.pitch;
     if (Math.hypot(eY, eP) < TRIG_ERR) {
-        // pulse fire so cook weapons release before they overcook
-        const now = performance.now();
-        if (!S.pulse.on && now >= S.pulse.until) { S.pulse.on = true; S.pulse.until = now + 250; }
-        else if (S.pulse.on && now >= S.pulse.until) { S.pulse.on = false; S.pulse.until = now + 150; }
-        if (S.pulse.on) {
+        if (S.trigMode === 'hold') {
+          // hold fire the whole time the aim is on target — max dps for
+          // everything that isn't a cook weapon
           cmd[4] |= FLAG.aim | FLAG.fireHeld;
           if (!S.pulse.held) cmd[4] |= FLAG.firePressed;
           S.pulse.held = true;
-        } else S.pulse.held = false;
+        } else {
+          // pulse fire so cook weapons release before they overcook
+          const now = performance.now();
+          if (!S.pulse.on && now >= S.pulse.until) { S.pulse.on = true; S.pulse.until = now + 250; }
+          else if (S.pulse.on && now >= S.pulse.until) { S.pulse.on = false; S.pulse.until = now + 150; }
+          if (S.pulse.on) {
+            cmd[4] |= FLAG.aim | FLAG.fireHeld;
+            if (!S.pulse.held) cmd[4] |= FLAG.firePressed;
+            S.pulse.held = true;
+          } else S.pulse.held = false;
+        }
       } else { S.pulse.on = false; S.pulse.held = false; }
   }
 
@@ -533,6 +595,9 @@
       ${opt('aimHold', 'Aim key = hold')}
       ${opt('norecoil', 'No-recoil')}
       ${row('trig', 'Triggerbot')}
+      ${cyc('trigMode', 'Trigger mode')}
+      ${opt('autosprint', 'Auto-sprint')}
+      ${opt('dodge', 'Auto-dodge')}
       <div class="rw">
         <span class="lb" style="cursor:default">Cone <b id="ppFovV">${S.fov}</b>°</span>
         <input class="sl" id="ppFov" type="range" min="5" max="90" step="1" value="${S.fov}">
@@ -547,7 +612,7 @@
       </div>
       <div class="st" id="ppSt">booting…</div>`;
 
-    const CYCLE = { aimStyle: ['full', 'soft', 'snap'], targetPri: ['crosshair', 'lowhp'] };
+    const CYCLE = { aimStyle: ['full', 'soft', 'snap'], targetPri: ['crosshair', 'lowhp', 'threat'], trigMode: ['pulse', 'hold'] };
     guiEl.querySelectorAll('[data-c]').forEach((el) =>
       el.addEventListener('click', () => {
         const opts = CYCLE[el.dataset.c];
@@ -678,6 +743,20 @@
         }
       }
 
+      // incoming warning — someone has a throw committed on me
+      let inc = null;
+      for (const en of enemies()) if (en.incoming) { inc = en; break; }
+      if (inc) {
+        const fl = (0.65 + 0.35 * Math.sin(performance.now() / 80)).toFixed(2);
+        ctx.textAlign = 'center';
+        ctx.font = '800 34px ui-monospace, monospace';
+        ctx.fillStyle = `rgba(255,64,48,${fl})`;
+        ctx.fillText('INCOMING', cx, 64);
+        ctx.font = '700 13px ui-monospace, monospace';
+        ctx.fillStyle = '#ffd9d4';
+        ctx.fillText(`${inc.name} — ${inc.throwKind || inc.kind || 'throw'}`, cx, 84);
+      }
+
       for (const en of enemies()) {
         const chest = { x: en.pos.x, y: en.pos.y + (en.crouch ? 0.75 : 1.05), z: en.pos.z };
         const scr = project(vp, chest, W, H);
@@ -758,6 +837,34 @@
         ctx.fillText(String(en.hp), x + 4, y + 14);
         ctx.fillStyle = en.hp <= 30 ? '#ff6b5e' : '#eae4d6';
         ctx.fillText(String(en.hp), x + 3, y + 13);
+
+        // intent tags: on-me, dry, charging, shielded — who to kill first
+        if (!en.ally) {
+          const tags = [];
+          if (en.watching) tags.push(['EYE', '#ff4d4d']);
+          if (en.dry) tags.push(['RELOAD', '#ffa64d']);
+          if (en.cook >= 0.35) tags.push(['COOK', '#f2d81d']);
+          if (en.shielded) tags.push(['SHIELD', '#4dd2ff']);
+          if (tags.length) {
+            ctx.font = '700 10px ui-monospace, monospace';
+            ctx.textAlign = 'left';
+            let total = 0;
+            for (const [t2] of tags) total += ctx.measureText(t2 + ' ').width;
+            let tx = head.x - total / 2;
+            for (const [t2, col] of tags) {
+              ctx.fillStyle = '#000c';
+              ctx.fillText(t2, tx + 1, y - 21);
+              ctx.fillStyle = col;
+              ctx.fillText(t2, tx, y - 22);
+              tx += ctx.measureText(t2 + ' ').width;
+            }
+          }
+          if (en.incoming) {
+            ctx.strokeStyle = '#f2d81d';
+            ctx.lineWidth = 3;
+            ctx.strokeRect(x - 2, y - 2, w + 4, h + 4);
+          }
+        }
       }
     };
     window.__ppDraw = draw;         // mock harness drives frames without rAF
